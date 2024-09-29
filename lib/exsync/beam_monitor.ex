@@ -5,13 +5,12 @@ defmodule ExSync.BeamMonitor do
 
   defmodule State do
     @enforce_keys [
-      :finished_reloading_timer,
       :throttle_timer,
       :watcher_pid,
       :unload_set,
       :reload_set
     ]
-    defstruct [:finished_reloading_timer, :throttle_timer, :watcher_pid, :unload_set, :reload_set]
+    defstruct [:throttle_timer, :watcher_pid, :unload_set, :reload_set]
   end
 
   def start_link(opts \\ []) do
@@ -25,7 +24,6 @@ defmodule ExSync.BeamMonitor do
     ExSync.Logger.debug("ExSync beam monitor started.")
 
     state = %State{
-      finished_reloading_timer: false,
       throttle_timer: nil,
       watcher_pid: watcher_pid,
       unload_set: MapSet.new(),
@@ -37,12 +35,6 @@ defmodule ExSync.BeamMonitor do
 
   @impl GenServer
   def handle_info({:file_event, _watcher_pid, {path, events}}, state) do
-    %State{finished_reloading_timer: finished_reloading_timer} = state
-
-    if finished_reloading_timer do
-      Process.cancel_timer(finished_reloading_timer)
-    end
-
     action = action(Path.extname(path), path, events)
 
     state =
@@ -50,10 +42,7 @@ defmodule ExSync.BeamMonitor do
       # TODO: Is this correct?
       |> maybe_update_throttle_timer()
 
-    reload_timeout = ExSync.Config.reload_timeout()
-    timer_ref = Process.send_after(self(), :reload_complete, reload_timeout)
-
-    {:noreply, %{state | finished_reloading_timer: timer_ref}}
+    {:noreply, state}
   end
 
   def handle_info({:file_event, watcher_pid, :stop}, %{watcher_pid: watcher_pid} = state) do
@@ -64,17 +53,6 @@ defmodule ExSync.BeamMonitor do
   def handle_info(:throttle_timer_complete, state) do
     state = reload_and_unload_modules(state)
     state = %State{state | throttle_timer: nil}
-
-    {:noreply, state}
-  end
-
-  def handle_info(:reload_complete, state) do
-    ExSync.Logger.debug("reload complete")
-
-    if callback = ExSync.Config.reload_callback() do
-      {mod, fun, args} = callback
-      Task.start(mod, fun, args)
-    end
 
     {:noreply, state}
   end
@@ -133,13 +111,22 @@ defmodule ExSync.BeamMonitor do
   defp reload_and_unload_modules(%State{} = state) do
     %State{reload_set: reload_set, unload_set: unload_set} = state
 
-    Enum.each(reload_set, fn module_path ->
-      ExSync.Utils.reload(module_path)
-    end)
+    reloaded_modules =
+      Enum.map(reload_set, fn module_path ->
+        {:module, module} = ExSync.Utils.reload(module_path)
+        module
+      end)
 
     Enum.each(unload_set, fn module_path ->
-      ExSync.Utils.unload(module_path)
+      {:module, _module} = ExSync.Utils.unload(module_path)
     end)
+
+    ExSync.Logger.debug("reload complete")
+
+    if callback = ExSync.Config.reload_callback() do
+      {mod, fun} = callback
+      {:ok, _} = Task.start(mod, fun, [reloaded_modules])
+    end
 
     %State{state | reload_set: MapSet.new(), unload_set: MapSet.new()}
   end

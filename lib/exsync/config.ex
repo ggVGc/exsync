@@ -1,10 +1,6 @@
 require Logger
 
 defmodule ExSync.Config do
-  def reload_timeout do
-    Application.get_env(application(), :reload_timeout, 150)
-  end
-
   def logging_enabled do
     Application.get_env(application(), :logging_enabled, true)
   end
